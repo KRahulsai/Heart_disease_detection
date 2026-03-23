@@ -1,5 +1,4 @@
 import numpy as np
-import pandas as pd
 from backend.model_loader import load_all
 
 # Lazy-loaded global cache
@@ -10,7 +9,6 @@ def _get_artifacts() -> dict:
     global _artifacts
     if _artifacts is None:
         _artifacts = load_all()
-        # Add imputer to artifacts if not already there (model_loader needs update too)
     return _artifacts
 
 
@@ -29,34 +27,46 @@ RENAMING_MAP = {
 }
 
 
-def feature_engineer(df: pd.DataFrame) -> pd.DataFrame:
-    """Apply identical feature engineering as used in training."""
-    df = df.copy()
+def get_age_group(age: float) -> str:
+    if age <= 35: return 'Young'
+    if age <= 50: return 'Middle'
+    if age <= 65: return 'Senior'
+    return 'Elderly'
+
+
+def get_bp_category(bp: float) -> str:
+    if bp <= 120: return 'Normal'
+    if bp <= 140: return 'Elevated'
+    return 'High'
+
+
+def feature_engineer(data: dict) -> dict:
+    """Apply identical feature engineering using pure Python/numpy."""
+    # Ensure numeric for logic
+    age = float(data.get('age', 0))
     
-    # Use short names for logic
-    age = df['age'].iloc[0]
-    
-    # 1. Age groups (bins)
-    df['age_group'] = pd.cut(df['age'], bins=[0, 35, 50, 65, 100], labels=['Young', 'Middle', 'Senior', 'Elderly']).astype(str)
+    # 1. Age groups
+    data['age_group'] = get_age_group(age)
     
     # 2. Cholesterol-age ratio
-    if 'chol' in df.columns:
-        df['chol_age_ratio'] = df['chol'] / (df['age'] + 1)
+    chol = float(data.get('chol', 0))
+    data['chol_age_ratio'] = chol / (age + 1)
         
     # 3. Blood Pressure categories
-    if 'trestbps' in df.columns:
-        df['bp_category'] = pd.cut(df['trestbps'], bins=[0, 120, 140, 250], labels=['Normal', 'Elevated', 'High']).astype(str)
+    trestbps = float(data.get('trestbps', 0))
+    data['bp_category'] = get_bp_category(trestbps)
 
     # 4. Interaction features
-    if 'thalach' in df.columns and 'oldpeak' in df.columns:
-        df['hr_st_interaction'] = df['thalach'] * df['oldpeak']
+    thalach = float(data.get('thalach', 0))
+    oldpeak = float(data.get('oldpeak', 0))
+    data['hr_st_interaction'] = thalach * oldpeak
 
-    return df
+    return data
 
 
 def predict(input_data: dict) -> dict:
     """
-    Apply advanced features, KNN imputation, and prediction.
+    Apply advanced features, KNN imputation, and prediction (Pandas-free).
     """
     arts = _get_artifacts()
     model = arts["model"]
@@ -66,69 +76,72 @@ def predict(input_data: dict) -> dict:
     target_encoder = arts["target_encoder"]
     meta = arts["metadata"]
 
-    # 1. Convert input to DataFrame and Rename
-    df_input = pd.DataFrame([input_data])
-    df_input = df_input.rename(columns=RENAMING_MAP)
+    # 1. Rename and Clean Input
+    data = {RENAMING_MAP.get(k, k): v for k, v in input_data.items()}
     
-    # Ensure numeric types for engineering
-    for col in meta["numerical_features"]:
-        if col in df_input.columns:
-            df_input[col] = pd.to_numeric(df_input[col], errors='coerce')
-
-    # 2. Apply Feature Engineering
-    df_feat = feature_engineer(df_input)
+    # 2. Feature Engineering
+    data = feature_engineer(data)
     
-    # 3. Encode categoricals
-    cat_features = meta["categorical_features"]
-    for col in cat_features:
-        if col in df_feat.columns:
-            le = encoders.get(col)
-            if le:
-                val = str(df_feat[col].iloc[0])
-                if val not in le.classes_:
-                    # Fallback for unknown categories if needed, or handle missing
-                    df_feat[col] = le.transform([le.classes_[0]])[0] 
-                else:
-                    df_feat[col] = le.transform([val])[0]
-
-    # 4. Align columns with training
+    # 3. Handle Categoricals & Vectorize
     feature_names = meta["feature_names"]
-    X_input = df_feat[feature_names].copy()
+    cat_features = meta["categorical_features"]
     
-    # Handle zeros-as-missing for medical features
-    cols_maybe_missing = ['resting_blood_pressure', 'cholesterol', 'max_heart_rate', 'trestbps', 'chol', 'thalach']
-    for col in cols_maybe_missing:
-        if col in X_input.columns:
-            X_input[col] = X_input[col].replace(0, np.nan)
+    row = []
+    for feat in feature_names:
+        val = data.get(feat)
+        
+        if feat in cat_features:
+            le = encoders.get(feat)
+            if le:
+                str_val = str(val) if val is not None else "Missing"
+                if str_val not in le.classes_:
+                    val = le.transform([le.classes_[0]])[0]
+                else:
+                    val = le.transform([str_val])[0]
+        else:
+            # Numeric conversion
+            try:
+                val = float(val) if val is not None else np.nan
+            except:
+                val = np.nan
+            
+            # 4. Zeros-as-missing for specific medical features (consistency with training)
+            cols_maybe_missing = ['trestbps', 'chol', 'thalach', 'oldpeak']
+            if feat in cols_maybe_missing and val == 0:
+                val = np.nan
+        
+        row.append(val)
 
-    # 5. Impute
+    # 5. Impute & Scale
+    X = np.array(row).reshape(1, -1)
+    
     if imputer:
-        X_imputed = imputer.transform(X_input)
+        X_imputed = imputer.transform(X)
     else:
-        X_imputed = X_input.fillna(0).values
+        # Fallback to zero if imputer missing (should not happen)
+        mask = np.isnan(X)
+        X[mask] = 0
+        X_imputed = X
 
-    # 6. Scale
     X_scaled = scaler.transform(X_imputed)
 
-    # 7. Predict
+    # 6. Predict
     pred = model.predict(X_scaled)[0]
     proba = None
     if hasattr(model, "predict_proba"):
         proba = model.predict_proba(X_scaled)[0].tolist()
 
-    # Decode label
+    # 7. Decode label
     label = str(pred)
     if target_encoder is not None:
         label = target_encoder.inverse_transform([int(pred)])[0]
     else:
         target_classes = meta.get("target_classes", [])
-        if target_classes:
-            idx = int(pred)
-            if idx < len(target_classes):
-                label = target_classes[idx]
+        if target_classes and int(pred) < len(target_classes):
+            label = str(target_classes[int(pred)])
 
     return {
         "prediction": int(pred),
-        "label": str(label),
+        "label": label,
         "probability": proba,
     }
