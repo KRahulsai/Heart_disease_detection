@@ -1,0 +1,18 @@
+# Ignore large dev/training files from Vercel function bundle
+requirements_dev.txt
+catboost_info/
+*.pkl
+*.png
+*.csv
+.git
+.agents
+.cursor
+.gemini
+data/
+scripts/
+tests/
+# Keep only .onnx and .json in the model directory
+model/*.pkl
+model/*.png
+!model/*.onnx
+!model/*.json
