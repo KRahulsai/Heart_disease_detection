@@ -1,10 +1,5 @@
-"""
-Prediction module – Accepts a dict of feature values,
-applies the same preprocessing used during training,
-and returns the prediction + probability.
-"""
-
 import numpy as np
+import pandas as pd
 from backend.model_loader import load_all
 
 # Lazy-loaded global cache
@@ -15,110 +10,113 @@ def _get_artifacts() -> dict:
     global _artifacts
     if _artifacts is None:
         _artifacts = load_all()
+        # Add imputer to artifacts if not already there (model_loader needs update too)
     return _artifacts
 
 
-def validate_input(input_data: dict) -> dict:
-    """Check if the provided medical details are sufficient for a reliable prediction."""
-    # List of key medical indicators (excluding age, sex)
-    medical_features = [
-        'chest_pain_type', 'resting_blood_pressure', 'cholesterol', 
-        'fasting_blood_sugar', 'max_heart_rate_achieved', 'exercise_induced_angina', 
-        'st_depression', 'num_major_vessels', 'thalassemia',
-        # Handle original/short feature names just in case
-        'cp', 'trestbps', 'chol', 'fbs', 'thalach', 'exang', 'oldpeak', 'ca', 'thal'
-    ]
+RENAMING_MAP = {
+    'chest_pain_type': 'cp',
+    'resting_blood_pressure': 'trestbps',
+    'cholesterol': 'chol',
+    'fasting_blood_sugar': 'fbs',
+    'resting_ecg': 'restecg',
+    'max_heart_rate': 'thalach',
+    'exercise_induced_angina': 'exang',
+    'st_depression': 'oldpeak',
+    'st_slope': 'slope',
+    'num_major_vessels': 'ca',
+    'thalassemia': 'thal'
+}
+
+
+def feature_engineer(df: pd.DataFrame) -> pd.DataFrame:
+    """Apply identical feature engineering as used in training."""
+    df = df.copy()
     
-    meaningful_count = 0
-    total_medical = 0
+    # Use short names for logic
+    age = df['age'].iloc[0]
     
-    for feat in medical_features:
-        if feat in input_data:
-            total_medical += 1
-            val = input_data[feat]
-            # Convert to float for evaluation
-            try:
-                num_val = float(val)
-                # We consider 0 or empty as not meaningful for this validation layer
-                if num_val != 0:
-                    meaningful_count += 1
-            except:
-                pass
-                
-    # Threshold: If ONLY age and sex are entered (0 meaningful medical features)
-    if total_medical > 0 and meaningful_count == 0:
-        return {
-            "is_valid": False,
-            "reason": "predict_zero"
-        }
+    # 1. Age groups (bins)
+    df['age_group'] = pd.cut(df['age'], bins=[0, 35, 50, 65, 100], labels=['Young', 'Middle', 'Senior', 'Elderly']).astype(str)
+    
+    # 2. Cholesterol-age ratio
+    if 'chol' in df.columns:
+        df['chol_age_ratio'] = df['chol'] / (df['age'] + 1)
         
-    return {"is_valid": True}
+    # 3. Blood Pressure categories
+    if 'trestbps' in df.columns:
+        df['bp_category'] = pd.cut(df['trestbps'], bins=[0, 120, 140, 250], labels=['Normal', 'Elevated', 'High']).astype(str)
+
+    # 4. Interaction features
+    if 'thalach' in df.columns and 'oldpeak' in df.columns:
+        df['hr_st_interaction'] = df['thalach'] * df['oldpeak']
+
+    return df
 
 
 def predict(input_data: dict) -> dict:
     """
-    Parameters
-    ----------
-    input_data : dict
-        Keys = feature names, values = raw (unprocessed) feature values.
-
-    Returns
-    -------
-    dict with keys: prediction, probability, label
+    Apply advanced features, KNN imputation, and prediction.
     """
     arts = _get_artifacts()
     model = arts["model"]
     scaler = arts["scaler"]
+    imputer = arts.get("imputer")
     encoders = arts["encoders"]
     target_encoder = arts["target_encoder"]
     meta = arts["metadata"]
 
-    feature_names = meta["feature_names"]
+    # 1. Convert input to DataFrame and Rename
+    df_input = pd.DataFrame([input_data])
+    df_input = df_input.rename(columns=RENAMING_MAP)
+    
+    # Ensure numeric types for engineering
+    for col in meta["numerical_features"]:
+        if col in df_input.columns:
+            df_input[col] = pd.to_numeric(df_input[col], errors='coerce')
+
+    # 2. Apply Feature Engineering
+    df_feat = feature_engineer(df_input)
+    
+    # 3. Encode categoricals
     cat_features = meta["categorical_features"]
+    for col in cat_features:
+        if col in df_feat.columns:
+            le = encoders.get(col)
+            if le:
+                val = str(df_feat[col].iloc[0])
+                if val not in le.classes_:
+                    # Fallback for unknown categories if needed, or handle missing
+                    df_feat[col] = le.transform([le.classes_[0]])[0] 
+                else:
+                    df_feat[col] = le.transform([val])[0]
 
-    validation = validate_input(input_data)
-    if not validation["is_valid"]:
-        if validation.get("reason") == "predict_zero":
-            return {
-                "prediction": 0,
-                "probability": [1.0, 0.0],
-                "label": "0"  # Assuming target classes typically start with "0"
-            }
+    # 4. Align columns with training
+    feature_names = meta["feature_names"]
+    X_input = df_feat[feature_names].copy()
+    
+    # Handle zeros-as-missing for medical features
+    cols_maybe_missing = ['resting_blood_pressure', 'cholesterol', 'max_heart_rate', 'trestbps', 'chol', 'thalach']
+    for col in cols_maybe_missing:
+        if col in X_input.columns:
+            X_input[col] = X_input[col].replace(0, np.nan)
 
-    # Build feature vector in the correct order
-    row = []
-    for feat in feature_names:
-        val = input_data.get(feat)
-        if val is None:
-            raise ValueError(f"Missing feature: '{feat}'")
+    # 5. Impute
+    if imputer:
+        X_imputed = imputer.transform(X_input)
+    else:
+        X_imputed = X_input.fillna(0).values
 
-        if feat in cat_features:
-            le = encoders.get(feat)
-            if le is None:
-                raise ValueError(f"No encoder found for categorical feature '{feat}'")
-            str_val = str(val)
-            if str_val not in le.classes_:
-                raise ValueError(
-                    f"Unknown category '{str_val}' for feature '{feat}'. "
-                    f"Valid: {list(le.classes_)}"
-                )
-            val = le.transform([str_val])[0]
-        else:
-            val = float(val)
+    # 6. Scale
+    X_scaled = scaler.transform(X_imputed)
 
-        row.append(val)
-
-    # Scale
-    X = np.array(row).reshape(1, -1)
-    X_scaled = scaler.transform(X)
-
-    # Predict
+    # 7. Predict
     pred = model.predict(X_scaled)[0]
     proba = None
     if hasattr(model, "predict_proba"):
         proba = model.predict_proba(X_scaled)[0].tolist()
 
-    # Decode label if target encoder exists
+    # Decode label
     label = str(pred)
     if target_encoder is not None:
         label = target_encoder.inverse_transform([int(pred)])[0]

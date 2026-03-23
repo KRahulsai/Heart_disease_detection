@@ -34,10 +34,16 @@ from sklearn.metrics import (
     precision_score,
     recall_score,
 )
-from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.model_selection import train_test_split, RandomizedSearchCV, StratifiedKFold
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.svm import SVC
+from sklearn.impute import KNNImputer
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.ensemble import StackingClassifier
+from imblearn.over_sampling import SMOTE
+import lightgbm as lgb
+from catboost import CatBoostClassifier
 
 warnings.filterwarnings("ignore")
 
@@ -124,41 +130,44 @@ def eda_summary(df: pd.DataFrame, target: str):
     print(f"  [SAVED] {config.MODEL_DIR}/target_distribution.png\n")
 
 
+def feature_engineer(df: pd.DataFrame) -> pd.DataFrame:
+    """Apply advanced feature engineering to the heart disease dataset."""
+    df = df.copy()
+    
+    # 1. Age groups (bins)
+    df['age_group'] = pd.cut(df['age'], bins=[0, 35, 50, 65, 100], labels=['Young', 'Middle', 'Senior', 'Elderly']).astype(str)
+    
+    # 2. Cholesterol-age ratio
+    if 'cholesterol' in df.columns:
+        df['chol_age_ratio'] = df['cholesterol'] / (df['age'] + 1)
+    elif 'chol' in df.columns:
+        df['chol_age_ratio'] = df['chol'] / (df['age'] + 1)
+        
+    # 3. Blood Pressure categories
+    bp_col = 'resting_blood_pressure' if 'resting_blood_pressure' in df.columns else 'trestbps'
+    if bp_col in df.columns:
+        # standard medical thresholds (approximate)
+        df['bp_category'] = pd.cut(df[bp_col], bins=[0, 120, 140, 250], labels=['Normal', 'Elevated', 'High']).astype(str)
+
+    # 4. Interaction features (Combine key medical indicators)
+    hr_col = 'max_heart_rate' if 'max_heart_rate' in df.columns else 'thalach'
+    st_col = 'st_depression' if 'st_depression' in df.columns else 'oldpeak'
+    if hr_col in df.columns and st_col in df.columns:
+        df['hr_st_interaction'] = df[hr_col] * df[st_col]
+
+    return df
+
+
 def preprocess(df: pd.DataFrame, target: str):
     """
-    Handle missing values, encode categoricals, scale numericals.
-    Returns X_train, X_test, y_train, y_test, scaler, encoders, metadata.
+    Apply feature engineering, handle missing values with KNN,
+    encode categoricals, scale, and balance with SMOTE.
     """
-    df = df.copy()
+    df = feature_engineer(df)
 
     # Separate features and target
     y = df[target].copy()
     X = df.drop(columns=[target]).copy()
-
-    # Identify feature types
-    cat_cols = X.select_dtypes(include=["object", "category"]).columns.tolist()
-    num_cols = X.select_dtypes(include=[np.number]).columns.tolist()
-
-    print(f"  Numerical features ({len(num_cols)}): {num_cols}")
-    print(f"  Categorical features ({len(cat_cols)}): {cat_cols}\n")
-
-    # -- Treat zeros as missing for specific medical features --
-    cols_zero_as_missing = ['resting_blood_pressure', 'cholesterol', 'max_heart_rate_achieved', 'trestbps', 'chol', 'thalach']
-    for col in cols_zero_as_missing:
-        if col in X.columns:
-            X[col] = X[col].replace(0, np.nan)
-
-    # -- Missing values (Imputation) --
-    for col in num_cols:
-        if X[col].isnull().sum() > 0:
-            median_val = X[col].median()
-            X[col].fillna(median_val, inplace=True)
-            print(f"  Filled missing/zeros in '{col}' with median={median_val:.2f}")
-    for col in cat_cols:
-        if X[col].isnull().sum() > 0:
-            mode_val = X[col].mode()[0]
-            X[col].fillna(mode_val, inplace=True)
-            print(f"  Filled missing in '{col}' with mode='{mode_val}'")
 
     # -- Encode target if non-numeric --
     target_encoder = None
@@ -167,28 +176,54 @@ def preprocess(df: pd.DataFrame, target: str):
         y = pd.Series(target_encoder.fit_transform(y), name=target)
         print(f"  Encoded target classes: {dict(zip(target_encoder.classes_, target_encoder.transform(target_encoder.classes_)))}")
 
+    # -- Identify feature types --
+    cat_cols = X.select_dtypes(include=["object", "category"]).columns.tolist()
+    num_cols = X.select_dtypes(include=[np.number]).columns.tolist()
+
     # -- Encode categorical features --
     label_encoders: dict[str, LabelEncoder] = {}
     for col in cat_cols:
         le = LabelEncoder()
+        # Handle potential NaNs in categorical before encoding
+        X[col] = X[col].fillna("Missing")
         X[col] = le.fit_transform(X[col].astype(str))
         label_encoders[col] = le
-        print(f"  Label-encoded '{col}' -> {list(le.classes_)}")
 
-    # -- Ensure all columns are numeric --
-    feature_names = list(X.columns)
+    # -- Treat zeros as missing for specific medical features (pre-imputation) --
+    cols_maybe_missing = ['resting_blood_pressure', 'cholesterol', 'max_heart_rate', 'trestbps', 'chol', 'thalach']
+    for col in cols_maybe_missing:
+        if col in X.columns:
+            X[col] = X[col].replace(0, np.nan)
 
+    # -- Advanced Imputation (KNN) --
+    print("  Applying KNNImputer...")
+    imputer = KNNImputer(n_neighbors=5)
+    X_imputed = pd.DataFrame(imputer.fit_transform(X), columns=X.columns)
+
+    # -- Feature Selection (SelectKBest) --
+    print("  Performing feature selection...")
+    selector = SelectKBest(score_func=f_classif, k='all') # Keep all for now but calculate scores
+    X_selected = selector.fit_transform(X_imputed, y)
+    
     # -- Scale --
     scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
+    X_scaled = scaler.fit_transform(X_imputed)
 
     # -- Train-test split --
     X_train, X_test, y_train, y_test = train_test_split(
         X_scaled, y, test_size=0.2, random_state=42, stratify=y
     )
-    print(f"\n  Train size: {X_train.shape[0]}  |  Test size: {X_test.shape[0]}")
+
+    # -- Handle Class Imbalance (SMOTE) --
+    print("  Applying SMOTE for class balance...")
+    smote = SMOTE(random_state=42)
+    X_train_resampled, y_train_resampled = smote.fit_resample(X_train, y_train)
+
+    print(f"\n  Original train size: {X_train.shape[0]}  |  Resampled train size: {X_train_resampled.shape[0]}")
+    print(f"  Test size: {X_test.shape[0]}")
 
     # -- Metadata for inference --
+    feature_names = list(X.columns)
     metadata = {
         "feature_names": feature_names,
         "numerical_features": num_cols,
@@ -198,7 +233,7 @@ def preprocess(df: pd.DataFrame, target: str):
         "cat_encodings": {col: list(le.classes_) for col, le in label_encoders.items()},
     }
 
-    return X_train, X_test, y_train, y_test, scaler, label_encoders, target_encoder, metadata
+    return X_train_resampled, X_test, y_train_resampled, y_test, scaler, imputer, label_encoders, target_encoder, metadata
 
 
 # --------------------------------------------------
@@ -207,99 +242,106 @@ def preprocess(df: pd.DataFrame, target: str):
 
 MODELS = {
     "Random Forest": {
-        "model": RandomForestClassifier(random_state=42),
-        "params": {"n_estimators": [100, 200], "max_depth": [None, 5, 10], "min_samples_split": [2, 5]}
-    },
-    "Gradient Boosting": {
-        "model": GradientBoostingClassifier(random_state=42),
-        "params": {"n_estimators": [100, 200], "learning_rate": [0.05, 0.1], "max_depth": [3, 5]}
+        "model": RandomForestClassifier(random_state=42, class_weight='balanced'),
+        "params": {"n_estimators": [100, 300, 500], "max_depth": [None, 10, 20], "min_samples_split": [2, 5, 10]}
     },
     "XGBoost": {
         "model": XGBClassifier(use_label_encoder=False, eval_metric='logloss', random_state=42),
-        "params": {"n_estimators": [100, 200], "learning_rate": [0.05, 0.1], "max_depth": [3, 5]}
+        "params": {"n_estimators": [100, 300, 500], "learning_rate": [0.01, 0.05, 0.1], "max_depth": [3, 5, 7], "subsample": [0.8, 1.0]}
+    },
+    "LightGBM": {
+        "model": lgb.LGBMClassifier(random_state=42, verbose=-1, importance_type='gain'),
+        "params": {"n_estimators": [100, 300, 500], "learning_rate": [0.01, 0.05, 0.1], "num_leaves": [31, 62], "class_weight": ['balanced', None]}
+    },
+    "CatBoost": {
+        "model": CatBoostClassifier(random_state=42, verbose=0),
+        "params": {"iterations": [100, 300, 500], "learning_rate": [0.01, 0.05, 0.1], "depth": [4, 6, 8]}
     }
 }
 
 
 def train_and_evaluate(X_train, X_test, y_train, y_test, metadata):
-    """Train all models using GridSearchCV, evaluate, select best, save comparison chart."""
+    """Train all models using RandomizedSearchCV, evaluate, and build a Stacking Ensemble."""
     results = {}
-    best_model = None
-    best_score = -1
-    best_name = ""
+    best_estimators = []
+    
+    skf = StratifiedKFold(n_splits=10, shuffle=True, random_state=42)
 
     print(f"\n{'='*60}")
-    print("  Training & Hyperparameter Tuning (GridSearchCV)")
+    print("  Training & Hyperparameter Tuning (RandomizedSearchCV)")
     print(f"{'='*60}\n")
 
     for name, config in MODELS.items():
         print(f"  >> Tuning {name}...")
-        grid_search = GridSearchCV(
+        search = RandomizedSearchCV(
             estimator=config["model"],
-            param_grid=config["params"],
-            cv=3,
+            param_distributions=config["params"],
+            n_iter=20, # 50 might be too slow for this machine, using 20 for safety
+            cv=skf,
             n_jobs=-1,
-            scoring="f1_weighted"
+            scoring="f1",
+            random_state=42
         )
-        grid_search.fit(X_train, y_train)
+        search.fit(X_train, y_train)
         
-        # Get the best model from grid search
-        model = grid_search.best_estimator_
+        model = search.best_estimator_
+        best_estimators.append((name.lower().replace(" ", "_"), model))
+        
         y_pred = model.predict(X_test)
-
+        f1 = f1_score(y_test, y_pred, average="binary", zero_division=0)
         acc = accuracy_score(y_test, y_pred)
-        prec = precision_score(y_test, y_pred, average="weighted", zero_division=0)
-        rec = recall_score(y_test, y_pred, average="weighted", zero_division=0)
-        f1 = f1_score(y_test, y_pred, average="weighted", zero_division=0)
+        
+        results[name] = {"accuracy": acc, "f1": f1, "precision": precision_score(y_test, y_pred, zero_division=0), "recall": recall_score(y_test, y_pred, zero_division=0)}
+        
+        print(f"     Best Params: {search.best_params_}")
+        print(f"     Accuracy  : {acc:.4f} | F1-score: {f1:.4f}")
 
-        results[name] = {"accuracy": acc, "precision": prec, "recall": rec, "f1": f1}
+    # -- Stacking Ensemble --
+    print(f"\n  >> Building Stacking Ensemble...")
+    stacking_model = StackingClassifier(
+        estimators=best_estimators,
+        final_estimator=LogisticRegression(),
+        cv=skf
+    )
+    stacking_model.fit(X_train, y_train)
+    
+    y_pred_stack = stacking_model.predict(X_test)
+    f1_stack = f1_score(y_test, y_pred_stack, average="binary", zero_division=0)
+    acc_stack = accuracy_score(y_test, y_pred_stack)
+    
+    results["Stacking Ensemble"] = {
+        "accuracy": acc_stack, 
+        "f1": f1_stack, 
+        "precision": precision_score(y_test, y_pred_stack, zero_division=0), 
+        "recall": recall_score(y_test, y_pred_stack, zero_division=0)
+    }
+    
+    print(f"     Stacking accuracy: {acc_stack:.4f} | F1-score: {f1_stack:.4f}")
 
-        print(f"     Best Params: {grid_search.best_params_}")
-        print(f"     Accuracy  : {acc:.4f}")
-        print(f"     Precision : {prec:.4f}")
-        print(f"     Recall    : {rec:.4f}")
-        print(f"     F1-score  : {f1:.4f}")
-        print(f"     {'-'*40}")
-        print(classification_report(y_test, y_pred, zero_division=0))
+    # Find overall best
+    best_name = max(results, key=lambda k: results[k]["f1"])
+    best_f1 = results[best_name]["f1"]
+    
+    if best_name == "Stacking Ensemble":
+        best_model = stacking_model
+    else:
+        # Re-find the single estimator
+        best_model = next(est for name_key, est in best_estimators if name_key == best_name.lower().replace(" ", "_"))
 
-        # Confusion matrix
-        cm = confusion_matrix(y_test, y_pred)
-        plt.figure(figsize=(5, 4))
-        sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
-        plt.title(f"{name} - Confusion Matrix")
-        plt.ylabel("Actual")
-        plt.xlabel("Predicted")
-        plt.tight_layout()
-        safe_name = name.lower().replace(" ", "_").replace("xgboost", "xgb")
-        plt.savefig(f"model/cm_{safe_name}.png", dpi=150)
-        plt.close()
-
-        if f1 > best_score:
-            best_score = f1
-            best_model = model
-            best_name = name
-
-    # Comparison bar chart
+    # Comparison chart
     names = list(results.keys())
-    accs = [results[n]["accuracy"] for n in names]
     f1s = [results[n]["f1"] for n in names]
-    x = np.arange(len(names))
-    width = 0.35
-
-    fig, ax = plt.subplots(figsize=(10, 5))
-    ax.bar(x - width / 2, accs, width, label="Accuracy", color="#3498db")
-    ax.bar(x + width / 2, f1s, width, label="F1 Score", color="#e74c3c")
-    ax.set_ylabel("Score")
-    ax.set_title("Model Comparison (Tuned)")
-    ax.set_xticks(x)
-    ax.set_xticklabels(names, rotation=15, ha="right")
-    ax.legend()
-    ax.set_ylim(0, 1.1)
+    plt.figure(figsize=(10, 5))
+    sns.barplot(x=names, y=f1s, palette="viridis")
+    plt.title("Model Comparison (F1 Score)")
+    plt.ylabel("F1 Score")
+    plt.ylim(0, 1.1)
+    plt.xticks(rotation=15)
     plt.tight_layout()
     plt.savefig("model/model_comparison.png", dpi=150)
     plt.close()
 
-    print(f"\n  [BEST] Best Model: {best_name} (F1={best_score:.4f})\n")
+    print(f"\n  [BEST] Best Model: {best_name} (F1={best_f1:.4f})\n")
     return best_model, best_name, results
 
 
@@ -307,30 +349,30 @@ def train_and_evaluate(X_train, X_test, y_train, y_test, metadata):
 # 4. SAVE ARTIFACTS
 # --------------------------------------------------
 
-def save_artifacts(model, scaler, label_encoders, target_encoder, metadata, best_name, results):
+def save_artifacts(model, scaler, imputer, label_encoders, target_encoder, metadata, best_name, results):
     os.makedirs("model", exist_ok=True)
 
     joblib.dump(model, "model/model.pkl")
     joblib.dump(scaler, "model/scaler.pkl")
+    joblib.dump(imputer, "model/imputer.pkl")
     joblib.dump(label_encoders, "model/encoder.pkl")
     if target_encoder:
         joblib.dump(target_encoder, "model/target_encoder.pkl")
 
     metadata["best_model_name"] = best_name
-    metadata["results"] = {k: {m: round(v, 4) for m, v in vals.items()} for k, vals in results.items()}
+    metadata["results"] = {k: {m: round(float(v), 4) for m, v in vals.items()} for k, vals in results.items()}
     with open("model/metadata.json", "w") as f:
         json.dump(metadata, f, indent=2)
 
     print("  [SAVED] Artifacts:")
     print("     model/model.pkl")
     print("     model/scaler.pkl")
+    print("     model/imputer.pkl")
     print("     model/encoder.pkl")
     if target_encoder:
         print("     model/target_encoder.pkl")
     print("     model/metadata.json")
     print("     model/model_comparison.png")
-    print("     model/correlation_heatmap.png")
-    print("     model/target_distribution.png")
     print()
 
 
@@ -348,9 +390,9 @@ def main():
     target = detect_target(df, args.target)
 
     eda_summary(df, target)
-    X_train, X_test, y_train, y_test, scaler, label_encoders, target_encoder, metadata = preprocess(df, target)
+    X_train, X_test, y_train, y_test, scaler, imputer, label_encoders, target_encoder, metadata = preprocess(df, target)
     best_model, best_name, results = train_and_evaluate(X_train, X_test, y_train, y_test, metadata)
-    save_artifacts(best_model, scaler, label_encoders, target_encoder, metadata, best_name, results)
+    save_artifacts(best_model, scaler, imputer, label_encoders, target_encoder, metadata, best_name, results)
 
     print("  [DONE] Training complete! You can now start the backend & frontend.\n")
 

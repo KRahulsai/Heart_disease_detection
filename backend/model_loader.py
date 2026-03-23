@@ -35,11 +35,20 @@ def load_metadata() -> dict:
         return json.load(f)
 
 
+def load_imputer():
+    """Load the KNNImputer."""
+    imputer_path = config.MODEL_DIR / "imputer.pkl"
+    if imputer_path.exists():
+        return joblib.load(imputer_path)
+    return None
+
+
 def load_all():
     """Convenience – load everything at once."""
     return {
         "model": load_model(),
         "scaler": load_scaler(),
+        "imputer": load_imputer(),
         "encoders": load_encoders(),
         "target_encoder": load_target_encoder(),
         "metadata": load_metadata(),
