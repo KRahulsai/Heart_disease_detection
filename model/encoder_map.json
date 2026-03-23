@@ -1,0 +1,13 @@
+{
+  "age_group": [
+    "Elderly",
+    "Middle",
+    "Senior",
+    "Young"
+  ],
+  "bp_category": [
+    "Elevated",
+    "High",
+    "Normal"
+  ]
+}

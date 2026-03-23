@@ -73,7 +73,6 @@ def predict(input_data: dict) -> dict:
     scaler = arts["scaler"]
     imputer = arts.get("imputer")
     encoders = arts["encoders"]
-    target_encoder = arts["target_encoder"]
     meta = arts["metadata"]
 
     # 1. Rename and Clean Input
@@ -91,13 +90,19 @@ def predict(input_data: dict) -> dict:
         val = data.get(feat)
         
         if feat in cat_features:
-            le = encoders.get(feat)
-            if le:
-                str_val = str(val) if val is not None else "Missing"
-                if str_val not in le.classes_:
-                    val = le.transform([le.classes_[0]])[0]
+            classes = encoders.get(feat, [])
+            str_val = str(val) if val is not None else "Missing"
+            
+            if str_val in classes:
+                val = float(classes.index(str_val))
+            else:
+                # Fallback to 'Missing' if it exists, else 0
+                if "Missing" in classes:
+                    val = float(classes.index("Missing"))
+                elif classes:
+                    val = 0.0
                 else:
-                    val = le.transform([str_val])[0]
+                    val = 0.0
         else:
             # Numeric conversion
             try:
@@ -113,32 +118,61 @@ def predict(input_data: dict) -> dict:
         row.append(val)
 
     # 5. Impute & Scale
-    X = np.array(row).reshape(1, -1)
+    X = np.array(row, dtype=np.float32).reshape(1, -1)
     
+    # -- Imputation --
     if imputer:
-        X_imputed = imputer.transform(X)
+        if hasattr(imputer, "run"): # ONNX Session
+            X_imputed = imputer.run(None, {imputer.get_inputs()[0].name: X})[0]
+        else: # Falling back to pkl if available
+            X_imputed = imputer.transform(X)
     else:
-        # Fallback to zero if imputer missing (should not happen)
+        # Fallback to zero if imputer missing
         mask = np.isnan(X)
         X[mask] = 0
         X_imputed = X
 
-    X_scaled = scaler.transform(X_imputed)
+    # -- Scaling --
+    if hasattr(scaler, "run"): # ONNX Session
+        X_scaled = scaler.run(None, {scaler.get_inputs()[0].name: X_imputed.astype(np.float32)})[0]
+    else:
+        X_scaled = scaler.transform(X_imputed)
 
     # 6. Predict
-    pred = model.predict(X_scaled)[0]
-    proba = None
-    if hasattr(model, "predict_proba"):
-        proba = model.predict_proba(X_scaled)[0].tolist()
+    if hasattr(model, "run"): # ONNX Session
+        input_name = model.get_inputs()[0].name
+        # CatBoost ONNX usually returns [labels, probabilities]
+        outputs = model.run(None, {input_name: X_scaled.astype(np.float32)})
+        pred = int(outputs[0][0])
+        
+        # Handle probabilities (can be list of arrays or list of dicts/ZipMap)
+        proba = None
+        if len(outputs) > 1:
+            raw_proba = outputs[1]
+            if isinstance(raw_proba, list) and len(raw_proba) > 0:
+                if isinstance(raw_proba[0], dict):
+                    # ZipMap case: [{'0': prob0, '1': prob1}]
+                    proba = [raw_proba[0].get(k, raw_proba[0].get(int(k), 0)) for k in sorted(raw_proba[0].keys(), key=lambda x: int(x))]
+                elif hasattr(raw_proba[0], "tolist"):
+                    proba = raw_proba[0].tolist()
+                else:
+                    proba = raw_proba[0]
+    else:
+        pred = model.predict(X_scaled)[0]
+        proba = None
+        if hasattr(model, "predict_proba"):
+            proba = model.predict_proba(X_scaled)[0].tolist()
 
     # 7. Decode label
     label = str(pred)
-    if target_encoder is not None:
-        label = target_encoder.inverse_transform([int(pred)])[0]
+    target_classes = arts.get("target_encoder_classes")
+    if target_classes and int(pred) < len(target_classes):
+        label = str(target_classes[int(pred)])
     else:
-        target_classes = meta.get("target_classes", [])
-        if target_classes and int(pred) < len(target_classes):
-            label = str(target_classes[int(pred)])
+        # Fallback to metadata classes
+        meta_classes = meta.get("target_classes", [])
+        if meta_classes and int(pred) < len(meta_classes):
+            label = str(meta_classes[int(pred)])
 
     return {
         "prediction": int(pred),
