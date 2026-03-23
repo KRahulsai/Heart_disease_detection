@@ -9,18 +9,17 @@ import json
 import os
 import sys
 
+# Add project root to path so config can be imported
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
 import requests
 import streamlit as st
 import plotly.graph_objects as go
+import config
 
-# ──────────────────────────────────────────────
-# Configuration
-# ──────────────────────────────────────────────
-
-API_URL = os.environ.get("API_URL", "http://localhost:5000")
-
-# Try to load metadata locally (fallback if backend is not up)
-META_PATH = os.path.join(os.path.dirname(__file__), "..", "model", "metadata.json")
+# Use centralized configuration
+API_URL = config.API_URL
+META_PATH = config.METADATA_PATH
 
 
 def get_metadata() -> dict | None:

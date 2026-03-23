@@ -22,6 +22,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+import config
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from xgboost import XGBClassifier
 from sklearn.linear_model import LogisticRegression
@@ -101,16 +102,16 @@ def eda_summary(df: pd.DataFrame, target: str):
         print("  No missing values found.\n")
 
     # Save correlation heatmap for numeric features
-    os.makedirs("model", exist_ok=True)
+    os.makedirs(config.MODEL_DIR, exist_ok=True)
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
     if len(numeric_cols) >= 2:
         plt.figure(figsize=(12, 8))
         sns.heatmap(df[numeric_cols].corr(), annot=True, cmap="coolwarm", fmt=".2f", linewidths=0.5)
         plt.title("Feature Correlation Heatmap")
         plt.tight_layout()
-        plt.savefig("model/correlation_heatmap.png", dpi=150)
+        plt.savefig(config.MODEL_DIR / "correlation_heatmap.png", dpi=150)
         plt.close()
-        print("  [SAVED] model/correlation_heatmap.png")
+        print(f"  [SAVED] {config.MODEL_DIR}/correlation_heatmap.png")
 
     # Target distribution bar chart
     plt.figure(figsize=(6, 4))
@@ -118,9 +119,9 @@ def eda_summary(df: pd.DataFrame, target: str):
     plt.title("Target Distribution")
     plt.ylabel("Count")
     plt.tight_layout()
-    plt.savefig("model/target_distribution.png", dpi=150)
+    plt.savefig(config.MODEL_DIR / "target_distribution.png", dpi=150)
     plt.close()
-    print("  [SAVED] model/target_distribution.png\n")
+    print(f"  [SAVED] {config.MODEL_DIR}/target_distribution.png\n")
 
 
 def preprocess(df: pd.DataFrame, target: str):

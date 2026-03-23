@@ -17,6 +17,7 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 from backend.predict import predict
 from backend.model_loader import load_metadata
+import config
 
 app = Flask(__name__)
 CORS(app)
@@ -44,13 +45,6 @@ def metadata():
 def predict_endpoint():
     """
     Accept JSON body with feature key-value pairs.
-    Example:
-        {
-            "age": 52,
-            "sex": 1,
-            "cp": 0,
-            ...
-        }
     """
     try:
         data = request.get_json(force=True)
@@ -71,6 +65,5 @@ def predict_endpoint():
 # ──────────────────────────────────────────────
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    print(f"\n  🚀 Backend running on http://localhost:{port}\n")
-    app.run(host="0.0.0.0", port=port, debug=True)
+    print(f"\n  🚀 Backend running on http://localhost:{config.API_PORT}\n")
+    app.run(host=config.API_HOST, port=config.API_PORT, debug=config.API_DEBUG)
