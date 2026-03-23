@@ -26,12 +26,23 @@ CORS(app)
 # Routes
 # ──────────────────────────────────────────────
 
+@app.route("/", methods=["GET"])
+def home():
+    return jsonify({
+        "status": "ok", 
+        "message": "Heart Disease Detection API",
+        "endpoints": ["/api/health", "/api/metadata", "/api/predict"]
+    })
+
+
 @app.route("/health", methods=["GET"])
+@app.route("/api/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "message": "Heart Disease Detection API is running"})
 
 
 @app.route("/metadata", methods=["GET"])
+@app.route("/api/metadata", methods=["GET"])
 def metadata():
     """Return model metadata so the frontend can auto-generate input fields."""
     try:
@@ -42,6 +53,7 @@ def metadata():
 
 
 @app.route("/predict", methods=["POST"])
+@app.route("/api/predict", methods=["POST"])
 def predict_endpoint():
     """
     Accept JSON body with feature key-value pairs.
